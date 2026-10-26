@@ -38,8 +38,16 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     0
 }
 
-// TODO: implement the syscall
-pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
+/// Read/write one byte, or query a per-task syscall counter.
+pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
     trace!("kernel: sys_trace");
-    -1
+    match trace_request {
+        0 => unsafe { core::ptr::read_volatile(id as *const u8) as isize },
+        1 => {
+            unsafe { core::ptr::write_volatile(id as *mut u8, data as u8) };
+            0
+        }
+        2 => crate::task::syscall_count(id).map_or(-1, |count| count as isize),
+        _ => -1,
+    }
 }
