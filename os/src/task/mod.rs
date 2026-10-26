@@ -202,3 +202,28 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
 }
+
+/// Record a syscall before dispatch, including trace itself.
+pub fn record_syscall(id: usize) {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    if let Some(count) = inner.tasks[current].syscall_counts.get_mut(id) {
+        *count += 1;
+    }
+}
+
+/// Get a syscall counter for the current task.
+pub fn syscall_count(id: usize) -> Option<usize> {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    inner.tasks[inner.current_task]
+        .syscall_counts
+        .get(id)
+        .copied()
+}
+
+/// Access the current task's address space while holding the task manager borrow.
+pub fn with_current_memory<T>(f: impl FnOnce(&mut crate::mm::MemorySet) -> T) -> T {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    f(&mut inner.tasks[current].memory_set)
+}

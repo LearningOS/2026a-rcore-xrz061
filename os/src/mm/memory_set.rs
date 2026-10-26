@@ -233,6 +233,105 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    /// Validate and round a user mapping without truncating overflowing addresses.
+    fn user_page_range(start: usize, len: usize) -> Option<VPNRange> {
+        if start % PAGE_SIZE != 0 || start >= 1usize << 38 {
+            return None;
+        }
+        let end = start.checked_add(len)?.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
+        if end > (1usize << 38) / PAGE_SIZE {
+            return None;
+        }
+        Some(VPNRange::new(
+            VirtPageNum(start / PAGE_SIZE),
+            VirtPageNum(end),
+        ))
+    }
+
+    /// Map anonymous, zero-filled user pages. Conflicts are checked before allocation.
+    pub fn mmap(&mut self, start: usize, len: usize, prot: usize) -> isize {
+        if prot == 0 || prot & !7 != 0 {
+            return -1;
+        }
+        let Some(range) = Self::user_page_range(start, len) else {
+            return -1;
+        };
+        if range.into_iter().any(|vpn| self.translate(vpn).is_some()) {
+            return -1;
+        }
+        if len == 0 {
+            return 0;
+        }
+        let permission = MapPermission::from_bits((prot << 1) as u8).unwrap() | MapPermission::U;
+        let mut area = MapArea::new(
+            range.get_start().into(),
+            range.get_end().into(),
+            MapType::Framed,
+            permission,
+        );
+        for vpn in range {
+            let Some(frame) = frame_alloc() else {
+                return -1;
+            };
+            area.data_frames.insert(vpn, frame);
+        }
+        for vpn in range {
+            let ppn = area.data_frames[&vpn].ppn;
+            if !self
+                .page_table
+                .try_map(vpn, ppn, PTEFlags::from_bits(permission.bits).unwrap())
+            {
+                for mapped in VPNRange::new(range.get_start(), vpn) {
+                    self.page_table.unmap(mapped);
+                }
+                return -1;
+            }
+        }
+        self.areas.push(area);
+        0
+    }
+
+    /// Unmap a fully mapped range and split its owners so fork retains no holes.
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        let Some(range) = Self::user_page_range(start, len) else {
+            return -1;
+        };
+        for vpn in range {
+            match self.translate(vpn) {
+                Some(pte) if pte.flags().contains(PTEFlags::U) => {}
+                _ => return -1,
+            }
+        }
+        if len == 0 {
+            return 0;
+        }
+        let start = range.get_start();
+        let end = range.get_end();
+        for mut area in core::mem::take(&mut self.areas) {
+            let left = area.vpn_range.get_start();
+            let right = area.vpn_range.get_end();
+            let cut_start = left.max(start);
+            let cut_end = right.min(end);
+            if cut_start >= cut_end {
+                self.areas.push(area);
+                continue;
+            }
+            for vpn in VPNRange::new(cut_start, cut_end) {
+                area.unmap_one(&mut self.page_table, vpn);
+            }
+            if cut_end < right {
+                let mut suffix =
+                    MapArea::new(cut_end.into(), right.into(), area.map_type, area.map_perm);
+                suffix.data_frames = area.data_frames.split_off(&cut_end);
+                self.areas.push(suffix);
+            }
+            if left < cut_start {
+                area.vpn_range = VPNRange::new(left, cut_start);
+                self.areas.push(area);
+            }
+        }
+        0
+    }
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {
