@@ -3,7 +3,8 @@ use super::{
     SuperBlock,
 };
 use crate::BLOCK_SZ;
-use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use alloc::sync::{Arc, Weak};
 use spin::Mutex;
 ///An easy file system on block
 pub struct EasyFileSystem {
@@ -15,6 +16,7 @@ pub struct EasyFileSystem {
     pub data_bitmap: Bitmap,
     inode_area_start_block: u32,
     data_area_start_block: u32,
+    pub(crate) opened_inodes: BTreeMap<u32, Weak<Inode>>,
 }
 
 type DataBlock = [u8; BLOCK_SZ];
@@ -45,6 +47,7 @@ impl EasyFileSystem {
             data_bitmap,
             inode_area_start_block: 1 + inode_bitmap_blocks,
             data_area_start_block: 1 + inode_total_blocks + data_bitmap_blocks,
+            opened_inodes: BTreeMap::new(),
         };
         // clear all blocks
         for i in 0..total_blocks {
@@ -99,6 +102,7 @@ impl EasyFileSystem {
                     ),
                     inode_area_start_block: 1 + super_block.inode_bitmap_blocks,
                     data_area_start_block: 1 + inode_total_blocks + super_block.data_bitmap_blocks,
+                    opened_inodes: BTreeMap::new(),
                 };
                 Arc::new(Mutex::new(efs))
             })
@@ -120,6 +124,12 @@ impl EasyFileSystem {
             block_id,
             (inode_id % inodes_per_block) as usize * inode_size,
         )
+    }
+    /// Get data block by id
+    pub(crate) fn inode_id(&self, block: usize, offset: usize) -> u32 {
+        ((block - self.inode_area_start_block as usize)
+            * (BLOCK_SZ / core::mem::size_of::<DiskInode>())
+            + offset / core::mem::size_of::<DiskInode>()) as u32
     }
     /// Get data block by id
     pub fn get_data_block_id(&self, data_block_id: u32) -> u32 {

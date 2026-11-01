@@ -4,10 +4,10 @@ use alloc::sync::Arc;
 
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    mm::{checked_user_buffer, checked_user_str, translated_refmut, translated_str, PTEFlags},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+        suspend_current_and_run_next, TaskControlBlock,
     },
 };
 
@@ -102,33 +102,46 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Copy time through validated user pages, including an unaligned, split TimeVal.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let us = crate::timer::get_time_us();
+    let fields = [us / 1_000_000, us % 1_000_000];
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            fields.as_ptr() as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    let Some(buffers) =
+        checked_user_buffer(current_user_token(), ts as usize, bytes.len(), PTEFlags::W)
+    else {
+        return -1;
+    };
+    let mut offset = 0;
+    for buffer in buffers {
+        let end = offset + buffer.len();
+        buffer.copy_from_slice(&bytes[offset..end]);
+        offset = end;
+    }
+    0
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Allocate anonymous pages in the current process address space.
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .memory_set
+        .mmap(start, len, prot)
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Release pages from the current process address space.
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .memory_set
+        .munmap(start, len)
 }
 
 /// change data segment size
@@ -141,21 +154,29 @@ pub fn sys_sbrk(size: i32) -> isize {
     }
 }
 
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Construct a child directly from ELF without copying the parent's address space.
+pub fn sys_spawn(path: *const u8) -> isize {
+    let Some(path) = checked_user_str(current_user_token(), path) else {
+        return -1;
+    };
+    let Some(inode) = open_file(&path, OpenFlags::RDONLY) else {
+        return -1;
+    };
+    let data = inode.read_all();
+    let parent = current_task().unwrap();
+    let child = Arc::new(TaskControlBlock::new(&data));
+    let pid = child.getpid();
+    child.inner_exclusive_access().parent = Some(Arc::downgrade(&parent));
+    parent.inner_exclusive_access().children.push(child.clone());
+    add_task(child);
+    pid as isize
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Set a scheduling weight without changing accumulated virtual runtime.
+pub fn sys_set_priority(prio: isize) -> isize {
+    if prio < 2 {
+        return -1;
+    }
+    current_task().unwrap().inner_exclusive_access().priority = prio as usize;
+    prio
 }

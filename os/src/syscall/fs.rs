@@ -1,6 +1,9 @@
 //! File and filesystem-related syscalls
-use crate::fs::{open_file, OpenFlags, Stat};
-use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
+use crate::fs::{open_file, OpenFlags, Stat, ROOT_INODE};
+use crate::mm::{
+    checked_user_buffer, checked_user_str, translated_byte_buffer, translated_str, PTEFlags,
+    UserBuffer,
+};
 use crate::task::{current_task, current_user_token};
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
@@ -75,29 +78,66 @@ pub fn sys_close(fd: usize) -> isize {
     0
 }
 
-/// YOUR JOB: Implement fstat.
-pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Copy a fully initialized stat through validated user pages.
+pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
+    let task = current_task().unwrap();
+    let file = {
+        let inner = task.inner_exclusive_access();
+        let Some(Some(file)) = inner.fd_table.get(fd) else {
+            return -1;
+        };
+        file.clone()
+    };
+    let Some(stat) = file.stat() else {
+        return -1;
+    };
+    let Some(buffers) = checked_user_buffer(
+        current_user_token(),
+        st as usize,
+        core::mem::size_of::<Stat>(),
+        PTEFlags::W,
+    ) else {
+        return -1;
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &stat as *const Stat as *const u8,
+            core::mem::size_of::<Stat>(),
+        )
+    };
+    let mut offset = 0;
+    for buffer in buffers {
+        let end = offset + buffer.len();
+        buffer.copy_from_slice(&bytes[offset..end]);
+        offset = end;
+    }
+    0
 }
 
-/// YOUR JOB: Implement linkat.
-pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Link two names to the same inode without copying file contents.
+pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
+    let token = current_user_token();
+    let Some(old) = checked_user_str(token, old_name) else {
+        return -1;
+    };
+    let Some(new) = checked_user_str(token, new_name) else {
+        return -1;
+    };
+    if ROOT_INODE.link(&old, &new) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement unlinkat.
-pub fn sys_unlinkat(_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Remove one name and reclaim an unlinked inode after its final open handle.
+pub fn sys_unlinkat(name: *const u8) -> isize {
+    let Some(name) = checked_user_str(current_user_token(), name) else {
+        return -1;
+    };
+    if ROOT_INODE.unlink(&name) {
+        0
+    } else {
+        -1
+    }
 }
