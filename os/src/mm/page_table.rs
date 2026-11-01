@@ -8,13 +8,21 @@ use bitflags::*;
 bitflags! {
     /// page table entry flags
     pub struct PTEFlags: u8 {
+        /// Valid entry.
         const V = 1 << 0;
+        /// Read permission.
         const R = 1 << 1;
+        /// Write permission.
         const W = 1 << 2;
+        /// Execute permission.
         const X = 1 << 3;
+        /// User access permission.
         const U = 1 << 4;
+        /// Global mapping.
         const G = 1 << 5;
+        /// Page has been accessed.
         const A = 1 << 6;
+        /// Page has been written.
         const D = 1 << 7;
     }
 }
@@ -99,7 +107,7 @@ impl PageTable {
                 break;
             }
             if !pte.is_valid() {
-                let frame = frame_alloc().unwrap();
+                let frame = frame_alloc()?;
                 *pte = PageTableEntry::new(frame.ppn, PTEFlags::V);
                 self.frames.push(frame);
             }
@@ -132,6 +140,16 @@ impl PageTable {
         assert!(!pte.is_valid(), "vpn {:?} is mapped before mapping", vpn);
         *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
     }
+    /// Fallible mapping for memory requested by a user process.
+    pub fn try_map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) -> bool {
+        if let Some(pte) = self.find_pte_create(vpn) {
+            if !pte.is_valid() {
+                *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
+                return true;
+            }
+        }
+        false
+    }
     /// remove the map between virtual page number and physical page number
     #[allow(unused)]
     pub fn unmap(&mut self, vpn: VirtPageNum) {
@@ -141,7 +159,9 @@ impl PageTable {
     }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
-        self.find_pte(vpn).map(|pte| *pte)
+        self.find_pte(vpn)
+            .filter(|pte| pte.is_valid())
+            .map(|pte| *pte)
     }
     /// get the physical address from the virtual address
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
@@ -158,6 +178,57 @@ impl PageTable {
     pub fn token(&self) -> usize {
         8usize << 60 | self.root_ppn.0
     }
+}
+
+/// Validate every user page before returning physical slices, including split objects.
+pub fn checked_user_buffer(
+    token: usize,
+    start: usize,
+    len: usize,
+    permission: PTEFlags,
+) -> Option<Vec<&'static mut [u8]>> {
+    let end = start.checked_add(len)?;
+    // User mappings occupy the lower canonical half of Sv39.
+    if start >= 1usize << 38 || end > 1usize << 38 {
+        return None;
+    }
+    let table = PageTable::from_token(token);
+    let mut buffers = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let va = VirtAddr::from(cursor);
+        let pte = table.translate(va.floor())?;
+        if !pte.flags().contains(PTEFlags::U | permission) {
+            return None;
+        }
+        let count = (crate::config::PAGE_SIZE - va.page_offset()).min(end - cursor);
+        buffers.push(&mut pte.ppn().get_bytes_array()[va.page_offset()..va.page_offset() + count]);
+        cursor += count;
+    }
+    Some(buffers)
+}
+
+/// Read a bounded, NUL-terminated path without accepting supervisor or invalid pages.
+pub fn checked_user_str(token: usize, ptr: *const u8) -> Option<String> {
+    let table = PageTable::from_token(token);
+    let mut bytes = Vec::new();
+    for offset in 0..crate::config::PAGE_SIZE {
+        let address = (ptr as usize).checked_add(offset)?;
+        if address >= 1usize << 38 {
+            return None;
+        }
+        let va = VirtAddr::from(address);
+        let pte = table.translate(va.floor())?;
+        if !pte.flags().contains(PTEFlags::U | PTEFlags::R) {
+            return None;
+        }
+        let byte = pte.ppn().get_bytes_array()[va.page_offset()];
+        if byte == 0 {
+            return String::from_utf8(bytes).ok();
+        }
+        bytes.push(byte);
+    }
+    None
 }
 
 /// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table

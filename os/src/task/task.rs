@@ -68,6 +68,10 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+    /// Scheduling weight; valid values are at least two.
+    pub priority: usize,
+    /// Accumulated virtual runtime used by the Stride scheduler.
+    pub stride: u128,
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +122,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: 16,
+                    stride: 0,
                 })
             },
         };
@@ -191,6 +197,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: 16,
+                    stride: 0,
                 })
             },
         });

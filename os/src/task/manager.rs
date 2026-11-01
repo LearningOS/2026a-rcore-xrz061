@@ -9,7 +9,7 @@ pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// Stride scheduler with stable ordering for equal virtual runtimes.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
@@ -23,7 +23,23 @@ impl TaskManager {
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let (index, minimum) = self
+            .ready_queue
+            .iter()
+            .enumerate()
+            .map(|(index, task)| (index, task.inner_exclusive_access().stride))
+            .min_by_key(|&(_, stride)| stride)?;
+        // A common offset preserves ordering and keeps accumulated values bounded.
+        for task in &self.ready_queue {
+            task.inner_exclusive_access().stride -= minimum;
+        }
+        let task = self.ready_queue.remove(index).unwrap();
+        {
+            let mut inner = task.inner_exclusive_access();
+            // Wider arithmetic keeps pass nonzero even for isize::MAX priority.
+            inner.stride += (1u128 << 64) / inner.priority as u128;
+        }
+        Some(task)
     }
 }
 
