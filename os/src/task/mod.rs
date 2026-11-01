@@ -89,6 +89,11 @@ pub fn exit_current_and_run_next(exit_code: i32) {
     drop(task_inner);
 
     // Move the task to stop-wait status, to avoid kernel stack from being freed
+    {
+        let mut inner = process.inner_exclusive_access();
+        inner.mutex_detector.forget_thread(tid);
+        inner.semaphore_detector.forget_thread(tid);
+    }
     if tid == 0 {
         add_stopping_task(task);
     } else {

@@ -8,13 +8,21 @@ use bitflags::*;
 bitflags! {
     /// page table entry flags
     pub struct PTEFlags: u8 {
+        /// Valid entry.
         const V = 1 << 0;
+        /// Read permission.
         const R = 1 << 1;
+        /// Write permission.
         const W = 1 << 2;
+        /// Execute permission.
         const X = 1 << 3;
+        /// User access permission.
         const U = 1 << 4;
+        /// Global mapping.
         const G = 1 << 5;
+        /// Page has been accessed.
         const A = 1 << 6;
+        /// Page has been written.
         const D = 1 << 7;
     }
 }
@@ -139,7 +147,9 @@ impl PageTable {
     }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
-        self.find_pte(vpn).map(|pte| *pte)
+        self.find_pte(vpn)
+            .filter(|pte| pte.is_valid())
+            .map(|pte| *pte)
     }
     /// get the physical address from the virtual address
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
@@ -157,6 +167,34 @@ impl PageTable {
 }
 
 /// Create mutable `Vec<u8>` slice in kernel space from ptr in other address space. NOTICE: the content pointed to by the pointer `ptr` can cross physical pages.
+/// Validate every user page before returning physical slices, including split objects.
+pub fn checked_user_buffer(
+    token: usize,
+    start: usize,
+    len: usize,
+    permission: PTEFlags,
+) -> Option<Vec<&'static mut [u8]>> {
+    let end = start.checked_add(len)?;
+    // User mappings occupy the lower canonical half of Sv39.
+    if start >= 1usize << 38 || end > 1usize << 38 {
+        return None;
+    }
+    let table = PageTable::from_token(token);
+    let mut buffers = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let va = VirtAddr::from(cursor);
+        let pte = table.translate(va.floor())?;
+        if !pte.flags().contains(PTEFlags::U | permission) {
+            return None;
+        }
+        let count = (crate::config::PAGE_SIZE - va.page_offset()).min(end - cursor);
+        buffers.push(&mut pte.ppn().get_bytes_array()[va.page_offset()..va.page_offset() + count]);
+        cursor += count;
+    }
+    Some(buffers)
+}
+/// Translate a user byte buffer into physical page slices.
 pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&'static mut [u8]> {
     let page_table = PageTable::from_token(token);
     let mut start = ptr as usize;
